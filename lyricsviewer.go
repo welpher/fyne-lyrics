@@ -61,8 +61,21 @@ type LyricsViewer struct {
 	// the visual styling of the widget will not indicate interactivity.
 	OnLyricTapped func(lineNum int)
 
+	// LineStarts optionally provides each line's start time (seconds),
+	// matching len(lines). If nil, starts are derived from each line's
+	// first tagged word.
+	LineStarts []float64
+
 	lines  []string
 	synced bool
+
+	lineWords  [][]word
+	lineStarts []float64
+
+	timeDriven  bool
+	lastCurTime float64
+	lastPushAt  time.Time
+	predAnim    *fyne.Animation
 
 	// one-indexed - 0 means before the first line
 	// during an animation, currentLine is the line
@@ -83,7 +96,7 @@ type LyricsViewer struct {
 func NewLyricsViewer() *LyricsViewer {
 	s := &LyricsViewer{}
 	s.ExtendBaseWidget(s)
-	s.prototypeLyricLineSize = s.newLyricLine("Hello...", 0, false).MinSize()
+	s.prototypeLyricLineSize = newLyricLine(parseWords("Hello World"), nil).MinSize()
 	return s
 }
 
@@ -92,6 +105,13 @@ func (l *LyricsViewer) SetLyrics(lines []string, synced bool) {
 	l.lines = lines
 	l.synced = synced
 	l.currentLine = 0
+	l.timeDriven = false
+	l.stopPredictive()
+	l.lineWords = make([][]word, len(lines))
+	for i, ln := range lines {
+		l.lineWords[i] = parseWords(ln)
+	}
+	l.lineStarts = l.computeLineStarts()
 	if l.scroll != nil {
 		if synced {
 			l.scroll.Direction = container.ScrollNone
@@ -102,11 +122,34 @@ func (l *LyricsViewer) SetLyrics(lines []string, synced bool) {
 	l.updateContent()
 }
 
+func (l *LyricsViewer) computeLineStarts() []float64 {
+	if len(l.LineStarts) == len(l.lines) {
+		out := make([]float64, len(l.LineStarts))
+		copy(out, l.LineStarts)
+		return out
+	}
+	out := make([]float64, len(l.lineWords))
+	for i, words := range l.lineWords {
+		start := -1.0
+		for _, w := range words {
+			if w.start >= 0 {
+				start = w.start
+				break
+			}
+		}
+		out[i] = start
+	}
+	return out
+}
+
 // SetCurrentLine sets the current line that the lyric viewer is scrolled to.
 // Argument is *one-indexed* - SetCurrentLine(0) means setting the scroll to be
 // before the first line. In unsynced mode this is a no-op. This function is
 // typically called when the user has seeked the playing song to a new position.
 func (l *LyricsViewer) SetCurrentLine(line int) {
+	if l.timeDriven {
+		return
+	}
 	if line < 0 || line > len(l.lines) {
 		panic("SetCurrentLine: line number out of range")
 	}
@@ -114,18 +157,17 @@ func (l *LyricsViewer) SetCurrentLine(line int) {
 		l.currentLine = line
 		return // renderer not created yet or unsynced mode
 	}
-	inactiveColor := l.inactiveLyricColor()
 	if l.checkStopAnimation() && l.currentLine > 1 {
 		// we were in the middle of animation
 		// make sure prev line is right color
-		l.setLineColor(l.vbox.Objects[l.currentLine-1].(*lyricLine), inactiveColor, true)
+		l.setLineActive(l.vbox.Objects[l.currentLine-1].(*lyricLine), false, true)
 	}
 	if l.currentLine != 0 {
-		l.setLineColor(l.vbox.Objects[l.currentLine].(*lyricLine), inactiveColor, true)
+		l.setLineActive(l.vbox.Objects[l.currentLine].(*lyricLine), false, true)
 	}
 	l.currentLine = line
 	if l.currentLine != 0 {
-		l.setLineColor(l.vbox.Objects[l.currentLine].(*lyricLine), l.activeLyricColor(), true)
+		l.setLineActive(l.vbox.Objects[l.currentLine].(*lyricLine), true, true)
 	}
 	l.scroll.Offset.Y = l.offsetForLine(l.currentLine)
 	l.scroll.Refresh()
@@ -134,6 +176,9 @@ func (l *LyricsViewer) SetCurrentLine(line int) {
 // NextLine advances the lyric viewer to the next line with an animated scroll.
 // In unsynced mode this is a no-op.
 func (l *LyricsViewer) NextLine() {
+	if l.timeDriven {
+		return
+	}
 	if l.vbox == nil || !l.synced {
 		return // no renderer yet, or unsynced lyrics (no-op)
 	}
@@ -145,9 +190,9 @@ func (l *LyricsViewer) NextLine() {
 		// we were in the middle of animation - short-circuit it to completed
 		// make sure prev and current lines are right color and scrolled to the end
 		if l.currentLine > 1 {
-			l.setLineColor(l.vbox.Objects[l.currentLine-1].(*lyricLine), l.inactiveLyricColor(), true)
+			l.setLineActive(l.vbox.Objects[l.currentLine-1].(*lyricLine), false, true)
 		}
-		l.setLineColor(l.vbox.Objects[l.currentLine].(*lyricLine), l.activeLyricColor(), true)
+		l.setLineActive(l.vbox.Objects[l.currentLine].(*lyricLine), true, true)
 		l.scroll.Offset.Y = l.offsetForLine(l.currentLine)
 	}
 	l.currentLine++
@@ -162,6 +207,132 @@ func (l *LyricsViewer) NextLine() {
 
 	l.setupScrollAnimation(prevLine, nextLine)
 	l.anim.Start()
+}
+
+// SetPlayTime drives the lyric viewer from the current play position of the
+// song. curTime is the current play time in seconds; seeked=true forces an
+// immediate full reposition. SetPlayTime permanently switches the viewer
+// into time-driven mode, after which NextLine and SetCurrentLine become
+// no-ops. It must be called on the UI/main goroutine: it mutates widget
+// state and starts/stops animations, which are not thread-safe resources.
+func (l *LyricsViewer) SetPlayTime(curTime float64, seeked bool) {
+	if l.vbox == nil || !l.synced {
+		l.lastCurTime = curTime
+		return
+	}
+	if !l.timeDriven {
+		l.timeDriven = true
+	}
+	l.stopPredictive()
+	l.lastCurTime = curTime
+	l.lastPushAt = time.Now()
+
+	target := locateActiveLine(l.lineStarts, curTime)
+	if target < 0 {
+		l.setActiveLine(0, 0, seeked)
+	} else {
+		words := l.lineWords[target]
+		active := countActiveWords(words, curTime)
+		l.setActiveLine(target+1, active-1, seeked)
+	}
+	l.schedulePredictive()
+}
+
+func (l *LyricsViewer) setActiveLine(oneIndexedLine, activeWordIdx int, forceScroll bool) {
+	if oneIndexedLine == l.currentLine && !forceScroll {
+		l.updateActiveWord(activeWordIdx)
+		return
+	}
+	l.checkStopAnimation()
+	if l.currentLine > 0 && l.currentLine <= len(l.lines) {
+		l.setLineActive(l.vbox.Objects[l.currentLine].(*lyricLine), false, true)
+	}
+	l.currentLine = oneIndexedLine
+	var prevLine, nextLine *lyricLine
+	if l.currentLine > 1 {
+		prevLine = l.vbox.Objects[l.currentLine-1].(*lyricLine)
+	}
+	if l.currentLine >= 1 && l.currentLine <= len(l.lines) {
+		nextLine = l.vbox.Objects[l.currentLine].(*lyricLine)
+		l.setLineActive(nextLine, true, false)
+		l.updateActiveWord(activeWordIdx)
+	}
+	if forceScroll {
+		l.scroll.Offset.Y = l.offsetForLine(l.currentLine)
+		l.scroll.Refresh()
+	} else {
+		l.setupScrollAnimation(prevLine, nextLine)
+		l.anim.Start()
+	}
+}
+
+func (l *LyricsViewer) updateActiveWord(activeWordIdx int) {
+	if l.currentLine < 1 || l.currentLine > len(l.lines) {
+		return
+	}
+	ll := l.vbox.Objects[l.currentLine].(*lyricLine)
+	if ll.activeWordIdx == activeWordIdx {
+		return
+	}
+	ll.activeWordIdx = activeWordIdx
+	ll.Refresh()
+}
+
+const predictiveHorizon = 1 * time.Second
+const stallThreshold = 600 * time.Millisecond
+
+func (l *LyricsViewer) schedulePredictive() {
+	if l.currentLine < 1 || l.currentLine > len(l.lines) {
+		return
+	}
+	words := l.lineWords[l.currentLine-1]
+	b, ok := nextBoundary(words, l.lineStarts, l.currentLine-1, l.lastCurTime)
+	if !ok {
+		return
+	}
+	delta := b - l.lastCurTime
+	deltaDuration := time.Duration(delta * float64(time.Second))
+	if delta <= 0 || deltaDuration > predictiveHorizon {
+		return
+	}
+	cur := l.lastCurTime
+	l.predAnim = fyne.NewAnimation(deltaDuration, func(f float32) {
+		if f < 1 {
+			return
+		}
+		if time.Since(l.lastPushAt) > stallThreshold {
+			l.predAnim = nil
+			return
+		}
+		l.advanceTo(cur + delta)
+	})
+	l.predAnim.Curve = fyne.AnimationLinear
+	l.predAnim.Start()
+}
+
+func (l *LyricsViewer) advanceTo(next float64) {
+	l.lastCurTime = next
+	target := locateActiveLine(l.lineStarts, next)
+	var words []word
+	if target >= 0 {
+		words = l.lineWords[target]
+	} else if l.currentLine >= 1 {
+		words = l.lineWords[l.currentLine-1]
+	}
+	active := countActiveWords(words, next)
+	if target >= 0 && target+1 != l.currentLine {
+		l.setActiveLine(target+1, active-1, false)
+	} else {
+		l.updateActiveWord(active - 1)
+	}
+	l.schedulePredictive()
+}
+
+func (l *LyricsViewer) stopPredictive() {
+	if l.predAnim != nil {
+		l.predAnim.Stop()
+		l.predAnim = nil
+	}
 }
 
 func (l *LyricsViewer) Refresh() {
@@ -226,23 +397,23 @@ func (l *LyricsViewer) updateContent() {
 	}
 	l.updateSpacerSize(l.Size())
 	endSpacer := l.vbox.Objects[lnObj-1]
-	for i, line := range l.lines {
+	for i := range l.lines {
 		lineNum := i + 1 // one-indexed
 		useActiveColor := !l.synced || l.currentLine == lineNum
 		if lineNum < lnObj-1 {
 			rt := l.vbox.Objects[lineNum].(*lyricLine)
 			if useActiveColor {
-				l.setLineColor(rt, l.activeLyricColor(), false)
+				l.setLineActive(rt, true, false)
 			} else {
-				l.setLineColor(rt, l.inactiveLyricColor(), false)
+				l.setLineActive(rt, false, false)
 			}
-			l.setLineTextAndProperties(rt, line, lineNum, true)
+			l.setLineProperties(rt, lineNum, true)
 		} else if lineNum < lnObj {
 			// replacing end spacer (last element in Objects) with a new richtext
-			l.vbox.Objects[lineNum] = l.newLyricLine(line, lineNum, useActiveColor)
+			l.vbox.Objects[lineNum] = l.newLyricLine(lineNum, useActiveColor)
 		} else {
 			// extending the Objects slice
-			l.vbox.Objects = append(l.vbox.Objects, l.newLyricLine(line, lineNum, useActiveColor))
+			l.vbox.Objects = append(l.vbox.Objects, l.newLyricLine(lineNum, useActiveColor))
 		}
 	}
 	for i := len(l.lines) + 1; i < lnObj; i++ {
@@ -256,30 +427,22 @@ func (l *LyricsViewer) updateContent() {
 }
 
 func (l *LyricsViewer) setupScrollAnimation(currentLine, nextLine *lyricLine) {
-	// calculate total scroll distance for the animation
-	scrollDist := theme.Padding()
-	if currentLine != nil {
-		scrollDist += currentLine.Size().Height / 2
-	} else {
-		scrollDist += l.prototypeLyricLineSize.Height / 2
-	}
-	if nextLine != nil {
-		scrollDist += nextLine.Size().Height / 2
-	} else {
-		scrollDist += l.prototypeLyricLineSize.Height / 2
-	}
-
+	// scroll to the exact position that centers the active line
 	l.animStartOffset = l.scroll.Offset.Y
+	scrollDist := l.offsetForLine(l.currentLine) - l.animStartOffset
 	var alreadyUpdated bool
 	l.anim = fyne.NewAnimation(140*time.Millisecond, func(f float32) {
 		l.scroll.Offset.Y = l.animStartOffset + f*scrollDist
 		l.scroll.Refresh()
 		if !alreadyUpdated && f >= 0.5 {
 			if nextLine != nil {
-				l.setLineColor(nextLine, l.activeLyricColor(), true)
+				activeWord := nextLine.activeWordIdx
+				l.setLineActive(nextLine, true, false)
+				nextLine.activeWordIdx = activeWord
+				nextLine.Refresh()
 			}
 			if currentLine != nil {
-				l.setLineColor(currentLine, l.inactiveLyricColor(), true)
+				l.setLineActive(currentLine, false, true)
 			}
 			alreadyUpdated = true
 		}
@@ -305,21 +468,27 @@ func (l *LyricsViewer) offsetForLine(lineNum int /*one-indexed*/) float32 {
 	return offset
 }
 
-func (l *LyricsViewer) newLyricLine(text string, lineNum int, useActiveColor bool) *lyricLine {
-	ll := newLyricLine(text, nil)
-	l.setLineTextAndProperties(ll, text, lineNum, false)
+func (l *LyricsViewer) newLyricLine(lineNum int, useActiveColor bool) *lyricLine {
+	var words []word
+	if lineNum >= 1 && lineNum <= len(l.lineWords) {
+		words = l.lineWords[lineNum-1]
+	}
+	ll := newLyricLine(words, nil)
+	l.setLineProperties(ll, lineNum, false)
 	ll.HoveredColorName = l.hoveredLyricColor()
 	if useActiveColor {
 		ll.ColorName = l.activeLyricColor()
+		ll.InactiveColorName = l.inactiveLyricColor()
+		ll.activeWordIdx = len(words) - 1
 	} else {
 		ll.ColorName = l.inactiveLyricColor()
+		ll.InactiveColorName = l.inactiveLyricColor()
+		ll.activeWordIdx = -1
 	}
-
 	return ll
 }
 
-func (l *LyricsViewer) setLineTextAndProperties(ll *lyricLine, text string, lineNum int, refresh bool) {
-	ll.Text = text
+func (l *LyricsViewer) setLineProperties(ll *lyricLine, lineNum int, refresh bool) {
 	ll.SizeName = l.textSizeName()
 	ll.Alignment = l.Alignment
 	ll.Tappable = l.synced && l.OnLyricTapped != nil
@@ -333,9 +502,16 @@ func (l *LyricsViewer) setLineTextAndProperties(ll *lyricLine, text string, line
 	}
 }
 
-func (l *LyricsViewer) setLineColor(ll *lyricLine, colorName fyne.ThemeColorName, refresh bool) {
-	ll.ColorName = colorName
-	ll.HoveredColorName = l.hoveredLyricColor()
+func (l *LyricsViewer) setLineActive(ll *lyricLine, active bool, refresh bool) {
+	if active {
+		ll.ColorName = l.activeLyricColor()
+		ll.InactiveColorName = l.inactiveLyricColor()
+		ll.activeWordIdx = len(ll.words) - 1
+	} else {
+		ll.ColorName = l.inactiveLyricColor()
+		ll.InactiveColorName = l.inactiveLyricColor()
+		ll.activeWordIdx = -1
+	}
 	if refresh {
 		ll.Refresh()
 	}
